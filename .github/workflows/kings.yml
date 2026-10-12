@@ -1,0 +1,35 @@
+name: キングス速報
+
+on:
+  schedule:
+    - cron: "50 1-11 * * *"   # 日本時間 10:50〜20:50 に毎時起動
+  workflow_dispatch:
+    inputs:
+      test:
+        description: "テスト通知を送る"
+        type: boolean
+        default: true
+
+concurrency:
+  group: kings
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - name: 実行
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.test }}" = "true" ]; then
+            python notifier.py --test
+          else
+            python notifier.py
+          fi
