@@ -1,7 +1,7 @@
 """琉球ゴールデンキングス 試合速報 → ntfy 通知
 
 GitHub Actions から1時間おきに起動される。
-- 今日キングスの試合があり、開始75分前〜試合中なら、終了まで30秒おきにスコアを確認
+- 今日キングスの試合があれば、試合開始5分前から終了まで30秒おきにスコアを確認
 - ティップオフ / 各クォーター終了 / 4Q・延長の逆転・同点 / 試合終了 を ntfy に送る
 - クォーター終了時はキングスの得点上位3人、試合終了時は得点した全員の得点を添える
 
@@ -30,7 +30,8 @@ NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "").strip()
 NTFY_SERVER = os.environ.get("NTFY_SERVER", "https://ntfy.sh").rstrip("/")
 
 POLL_SEC = 30
-START_WINDOW_MIN = 75         # 開始何分前から見張るか
+START_WINDOW_MIN = 75         # この時間内に試合があれば、その起動で待機して担当する
+WATCH_LEAD_MIN = 5            # 見張りを始めるのは試合開始の何分前か
 MAX_RUN = timedelta(hours=5, minutes=40)  # GitHub Actions の6時間制限より手前で止める
 FALLBACK_UPDATE_MIN = 15      # クォーターが読み取れない時の定期スコア通知間隔
 
@@ -499,9 +500,15 @@ def main():
     if g.period == "FINAL":
         print("すでに終了")
         return
-    if g.tipoff and now < g.tipoff - timedelta(minutes=START_WINDOW_MIN) and not g.started:
-        print("まだ早い。次の起動で見張る。")
-        return
+    if g.tipoff and not g.started:
+        begin = g.tipoff - timedelta(minutes=WATCH_LEAD_MIN)
+        if now < g.tipoff - timedelta(minutes=START_WINDOW_MIN):
+            print("まだ早い。次の起動で見張る。")
+            return
+        wait = (begin - now).total_seconds()
+        if wait > 0:
+            print(f"開始{WATCH_LEAD_MIN}分前({begin:%H:%M})まで待機")
+            time.sleep(wait)
     watch(g)
 
 
