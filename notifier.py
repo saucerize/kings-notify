@@ -3,6 +3,7 @@
 GitHub Actions から1時間おきに起動される。
 - 今日キングスの試合があれば、試合開始5分前から終了まで30秒おきにスコアを確認
 - ティップオフ / 各クォーター終了 / 4Q・延長の逆転・同点 / 試合終了 を ntfy に送る
+- 試合開始前(またはティップオフ時)にキングスのスターティング5を送る
 - クォーター終了時はキングスの得点上位3人、試合終了時は得点した全員の得点を添える
 
 手動テスト:
@@ -124,29 +125,49 @@ def normalize_period(s):
     return None
 
 
+LEAGUE_RE = re.compile(r"^(B\.?[A-Z0-9]*|B[123]|B\.(PREMIER|ONE|NEXT)|ホーム|アウェイ)$", re.I)
+
+
+def _team_before(L, idx, stop):
+    """HOME/AWAY の行から上にさかのぼり、(正式名, 略称, 得点) を返す。"""
+    score, names = "--", []
+    for j in range(idx - 1, stop, -1):
+        x = L[j]
+        if SCORE_RE.match(x):
+            if not names and score == "--":
+                score = x
+            continue
+        if "位" in x or "｜" in x or "|" in x or LEAGUE_RE.match(x):
+            continue
+        names.append(x)
+        if len(names) == 2:
+            break
+    if len(names) < 2:
+        raise ValueError("チーム名が見つからない")
+    short, full = names
+    return full, short, score
+
+
 def parse_game(key, html):
     L = text_lines(html)
     di = next((i for i, l in enumerate(L) if DATE_RE.match(l)), None)
     if di is None:
         raise ValueError("試合日の行が見つからない")
     y, mo, d = map(int, DATE_RE.match(L[di]).groups())
-    home_full, home_short = L[di + 1], L[di + 2]
 
     hi = next(i for i in range(di, len(L)) if L[i] == "HOME")
-    home_score = next((L[j] for j in range(hi - 1, di, -1) if SCORE_RE.match(L[j])), "--")
+    wi = next(i for i in range(hi + 1, len(L)) if L[i] == "AWAY")
+    home_full, home_short, home_score = _team_before(L, hi, di)
 
-    ti = next((i for i in range(hi, len(L)) if TIP_RE.search(L[i])), None)
     tip = None
-    if ti is not None:
-        hh, mm = map(int, TIP_RE.search(L[ti]).groups())
-        tip = datetime(y, mo, d, hh, mm, tzinfo=JST)
-    ai_start = (ti if ti is not None else hi) + 1
-    if L[ai_start].upper() == "VS":
-        ai_start += 1
-    away_full, away_short = L[ai_start], L[ai_start + 1]
-
-    wi = next(i for i in range(ai_start, len(L)) if L[i] == "AWAY")
-    away_score = next((L[j] for j in range(wi - 1, ai_start, -1) if SCORE_RE.match(L[j])), "--")
+    for i in range(hi, wi):
+        if re.search(r"TIP\s*OFF", L[i], re.I):
+            m = re.search(r"(\d{1,2}):(\d{2})", L[i]) or re.search(r"(\d{1,2}):(\d{2})", L[i - 1])
+            if m:
+                tip = datetime(y, mo, d, int(m.group(1)), int(m.group(2)), tzinfo=JST)
+            break
+    stop = next((i for i in range(wi - 1, hi, -1) if re.search(r"TIP\s*OFF|^VS$", L[i], re.I)), hi)
+    away_full, away_short, away_score = _team_before(L, wi, stop)
 
     # スコアチャート欄: 「ホーム略称 / x / 状況 / y / アウェイ略称」
     status = None
@@ -162,7 +183,7 @@ def parse_game(key, html):
     if period is None:  # 念のためヘッダー周辺からも探す
         for l in L[di:wi + 1]:
             p = normalize_period(l)
-            if p and not TIP_RE.search(l):
+            if p and not re.search(r"TIP\s*OFF", l, re.I):
                 status, period = l, p
                 break
 
@@ -310,36 +331,42 @@ TABLES_JS = """
 """
 
 
+def load_boxscore(game):
+    """試合ページをブラウザで開き、(裏で届いたJSON一覧, 表示された表一覧) を返す。"""
+    _ensure_browser()
+    from playwright.sync_api import sync_playwright
+    blobs = []
+    with sync_playwright() as p:
+        b = p.chromium.launch()
+        page = b.new_page(user_agent=HEADERS["User-Agent"], locale="ja-JP")
+
+        def on_resp(resp):
+            if "json" in (resp.headers.get("content-type") or ""):
+                try:
+                    blobs.append(resp.json())
+                except Exception:
+                    pass
+        page.on("response", on_resp)
+        page.goto(DETAIL_URL.format(key=game.key), wait_until="networkidle", timeout=60000)
+        for label_text in ("ボックススコア", "BOX SCORE", "BOXSCORE"):
+            loc = page.get_by_text(label_text, exact=True)
+            if loc.count():
+                try:
+                    loc.first.click(timeout=5000)
+                    page.wait_for_load_state("networkidle", timeout=20000)
+                except Exception:
+                    pass
+                break
+        page.wait_for_timeout(2000)
+        tables = page.evaluate(TABLES_JS)
+        b.close()
+    return blobs, tables
+
+
 def fetch_kings_scorers(game):
     """キングス選手の (名前, 得点) を得点順で返す。取れなければ空リスト。"""
     try:
-        _ensure_browser()
-        from playwright.sync_api import sync_playwright
-        blobs = []
-        with sync_playwright() as p:
-            b = p.chromium.launch()
-            page = b.new_page(user_agent=HEADERS["User-Agent"], locale="ja-JP")
-
-            def on_resp(resp):
-                if "json" in (resp.headers.get("content-type") or ""):
-                    try:
-                        blobs.append(resp.json())
-                    except Exception:
-                        pass
-            page.on("response", on_resp)
-            page.goto(DETAIL_URL.format(key=game.key), wait_until="networkidle", timeout=60000)
-            for label_text in ("ボックススコア", "BOX SCORE", "BOXSCORE"):
-                loc = page.get_by_text(label_text, exact=True)
-                if loc.count():
-                    try:
-                        loc.first.click(timeout=5000)
-                        page.wait_for_load_state("networkidle", timeout=20000)
-                    except Exception:
-                        pass
-                    break
-            page.wait_for_timeout(2000)
-            tables = page.evaluate(TABLES_JS)
-            b.close()
+        blobs, tables = load_boxscore(game)
         rows = players_from_json(blobs) or players_from_tables(tables, game)
         rows = [(n, p) for n, p in rows if p > 0]
         rows.sort(key=lambda x: -x[1])
@@ -347,6 +374,93 @@ def fetch_kings_scorers(game):
         return rows
     except Exception as e:
         print(f"[boxscore] 取得失敗: {e}")
+        return []
+
+
+# ---------------------------------------------------------------- スターティング5
+STARTER_KEYS = ("StartingFlg", "StartFlg", "StartingFlag", "Starter", "IsStarter",
+                "Starting", "StarterFlag", "Start", "GS", "starter", "is_starter")
+STARTER_HEADS = ("S", "ST", "GS", "STARTER", "先発", "スタメン", "STARTING")
+MARKS = {"○", "◯", "●", "*", "＊", "S", "✓", "✔", "★", "◎"}
+
+
+def _truthy(v):
+    if isinstance(v, bool):
+        return v
+    return str(v).strip().upper() in ("1", "TRUE", "S", "Y", "YES", "○", "◯", "●", "*")
+
+
+def starters_from_json(blobs):
+    out = []
+    for blob in blobs:
+        for d in _walk_json(blob):
+            nk = next((k for k in NAME_KEYS if isinstance(d.get(k), str) and d.get(k)), None)
+            sk = next((k for k in STARTER_KEYS if k in d), None)
+            if not nk or not sk:
+                continue
+            team = next((str(d[k]) for k in TEAM_KEYS if k in d), None)
+            if team == str(KINGS_ID) and _truthy(d[sk]):
+                out.append(d[nk].strip())
+    out = list(dict.fromkeys(out))
+    return out if len(out) == 5 else []
+
+
+def starters_from_tables(tables, game):
+    """キングスの表から、先発の印が付いた5人を探す。"""
+    cands = []
+    for t in tables:
+        head = [h.strip().upper() for h in t["head"]]
+        rows = [r for r in t["rows"] if r and not any(w in " ".join(r) for w in TOTAL_WORDS)]
+        if len(rows) < 5:
+            continue
+        ni = next((i for i, h in enumerate(head) if any(w in h for w in ("選手", "PLAYER", "NAME"))), None)
+        width = max(len(r) for r in rows)
+        # 先発の印の列: 見出しで分かるか、ちょうど5行にだけ印がある列
+        cols = [i for i, h in enumerate(head) if h in STARTER_HEADS]
+        for i in range(width):
+            vals = [r[i].strip() if i < len(r) else "" for r in rows]
+            if sum(v in MARKS for v in vals) == 5:
+                cols.append(i)
+        for si in cols:
+            names = []
+            for r in rows:
+                v = r[si].strip() if si < len(r) else ""
+                if v not in MARKS and not _truthy(v):
+                    continue
+                if ni is not None and ni < len(r):
+                    name = r[ni].strip()
+                else:
+                    name = next((c.strip() for c in r if len(c.strip()) > 1
+                                 and not re.fullmatch(r"[\d.%:/\-#]+", c.strip())
+                                 and c.strip() not in MARKS), "")
+                if name:
+                    names.append(name)
+            if len(names) == 5:
+                cands.append((t.get("before", ""), names))
+                break
+    if not cands:
+        return []
+
+    def kings_score(before):
+        k = max(before.rfind("琉球"), before.rfind("キングス"))
+        o = max(before.rfind(game.opp), before.rfind(_short(game.opp)))
+        return k - o
+    mine = [n for before, n in cands if kings_score(before) > 0]
+    if mine:
+        return mine[0]
+    idx = 0 if game.kings_home else 1
+    return cands[idx][1] if len(cands) > idx else []
+
+
+def fetch_kings_starters(game):
+    """キングスの先発5人の名前を返す。まだ発表されていない・読めない時は空リスト。"""
+    try:
+        blobs, tables = load_boxscore(game)
+        names = starters_from_json(blobs) or starters_from_tables(tables, game)
+        print(f"[starters] {names}")
+        return names
+    except Exception as e:
+        print(f"[starters] 取得失敗: {e}")
         return []
 
 
@@ -373,6 +487,40 @@ def notify(title, body, tags="basketball", priority="default"):
         print(f"  送信失敗: {e}")
 
 
+# ---------------------------------------------------------------- ウィジェット用の状況ファイル
+STATUS_FILE = "status.json"
+
+
+def save_status(g, scorers=None):
+    """ホーム画面ウィジェットが読む status.json を更新してリポジトリに保存する。"""
+    import json
+    import subprocess
+    data = {
+        "key": g.key, "date": g.tipoff.strftime("%Y-%m-%d") if g.tipoff else None,
+        "tipoff": g.tipoff.strftime("%H:%M") if g.tipoff else None,
+        "home": g.home, "away": g.away, "kings_home": g.kings_home,
+        "home_score": g.home_score, "away_score": g.away_score,
+        "period": g.period, "scorers": [[n, p] for n, p in (scorers or [])],
+        "updated": datetime.now(JST).strftime("%Y-%m-%d %H:%M"),
+    }
+    with open(STATUS_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=1)
+    if not os.environ.get("GITHUB_ACTIONS"):
+        return
+    try:
+        run = lambda *c: subprocess.run(c, check=True, capture_output=True, text=True)
+        run("git", "config", "user.name", "kings-bot")
+        run("git", "config", "user.email", "kings-bot@users.noreply.github.com")
+        run("git", "add", STATUS_FILE)
+        if subprocess.run(["git", "diff", "--cached", "--quiet"]).returncode == 0:
+            return
+        run("git", "commit", "-m", f"状況更新 {data['updated']}")
+        run("git", "pull", "--rebase", "-q")
+        run("git", "push", "-q")
+    except Exception as e:
+        print(f"[status] 保存失敗: {e}")
+
+
 CURRENT_KEY = None
 PERIOD_LABEL = {"Q1": "1Q", "Q2": "2Q", "Q3": "3Q", "Q4": "4Q"}
 
@@ -391,6 +539,9 @@ def watch(game):
         print(f"[boxscore] ブラウザの準備に失敗: {e}")
     started_at = datetime.now(JST)
     prev = None
+    starters_sent = False
+    starter_tries = 0
+    last_starter_try = None
     last_fallback = None
     errors = 0
     warned = False
@@ -417,6 +568,16 @@ def watch(game):
             if g.tipoff and now > g.tipoff + timedelta(hours=4):
                 print("開始が確認できないまま4時間経過。終了。")
                 return
+            # 開始前: 2分おきに最大3回、スタメンが出ていないか確認
+            if (not starters_sent and starter_tries < 3 and
+                    (last_starter_try is None or now - last_starter_try >= timedelta(minutes=2))):
+                starter_tries += 1
+                last_starter_try = now
+                names = fetch_kings_starters(g)
+                if names:
+                    tip = f"{g.tipoff:%H:%M} TIP OFF" if g.tipoff else ""
+                    notify("📋 キングス スタメン", f"vs {g.opp}  {tip}\n" + " / ".join(names))
+                    starters_sent = True
             prev = g
             time.sleep(POLL_SEC)
             continue
@@ -425,7 +586,9 @@ def watch(game):
             if prev is None or prev.period != "FINAL":
                 win = g.kings_pts > g.opp_pts
                 body = f"FINAL  {g.scoreline()}"
-                sc = scorers_text(fetch_kings_scorers(g))
+                rows = fetch_kings_scorers(g)
+                save_status(g, rows)
+                sc = scorers_text(rows)
                 if sc:
                     body += "\n" + sc
                 notify("🏆 勝利!" if win else "試合終了", body,
@@ -434,15 +597,23 @@ def watch(game):
 
         if prev is None or not prev.started:
             first = prev is not None  # 開始前から見ていたなら「ティップオフ」
-            notify("🏀 ティップオフ!" if first else "🏀 試合中",
-                   f"vs {g.opp}" + ("" if first else f"  {label(g.period) or ''}  {g.scoreline()}"))
+            body = f"vs {g.opp}" + ("" if first else f"  {label(g.period) or ''}  {g.scoreline()}")
+            if not starters_sent:  # 開始前に読めなかった場合はここで添える
+                names = fetch_kings_starters(g)
+                if names:
+                    body += "\nスタメン: " + " / ".join(names)
+                    starters_sent = True
+            notify("🏀 ティップオフ!" if first else "🏀 試合中", body)
             last_fallback = now
+            save_status(g)
         else:
             # クォーター終了
             if g.period and prev.period and g.period != prev.period and prev.period != "HALF":
                 extra = "(ハーフタイム)" if g.period == "HALF" else ""
                 body = g.scoreline()
-                sc = scorers_text(fetch_kings_scorers(g), top=3)
+                rows = fetch_kings_scorers(g)
+                save_status(g, rows)
+                sc = scorers_text(rows, top=3)
                 if sc:
                     body += "\n" + sc
                 notify(f"{label(prev.period)}終了{extra}", body)
@@ -471,6 +642,11 @@ def main():
     if args[:1] == ["--key"]:
         g = parse_game(args[1], fetch(DETAIL_URL.format(key=args[1])))
         print(g, g.scoreline() if g.started else "(未開始)")
+        return
+
+    if args[:1] == ["--starters"]:
+        g = parse_game(args[1], fetch(DETAIL_URL.format(key=args[1])))
+        print(" / ".join(fetch_kings_starters(g)) or "スタメンを読み取れませんでした")
         return
 
     if args[:1] == ["--box"]:
