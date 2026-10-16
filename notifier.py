@@ -2,6 +2,7 @@
 
 GitHub Actions から1時間おきに起動される。
 - 今日キングスの試合があれば、試合開始5分前から終了まで30秒おきにスコアを確認
+  (試合中のスコアはページ最上部の速報帯から、クォーターはブラウザで描画したページから読む)
 - ティップオフ / 各クォーター終了 / 4Q・延長の逆転・同点 / 試合終了 を ntfy に送る
 - 試合開始前(またはティップオフ時)にキングスのスターティング5を送る
 - クォーター終了時はキングスの得点上位3人、試合終了時は得点した全員の得点を添える
@@ -78,6 +79,8 @@ class Game:
     tipoff: datetime | None
     status: str | None      # 生の状況表示(FINAL, 2Q 等)
     period: str | None      # 正規化: Q1..Q4, HALF, OT1.., FINAL
+    home_short: str = ""
+    away_short: str = ""
 
     @property
     def started(self):
@@ -188,8 +191,31 @@ def parse_game(key, html):
                 break
 
     as_int = lambda s: int(s) if s.isdigit() else None
-    return Game(key, home_full, away_full, as_int(home_score), as_int(away_score),
-                tip, status, period)
+    hs_, as_ = as_int(home_score), as_int(away_score)
+    # 試合中は見出しのスコアが「--」のままで、ページ最上部の速報帯にだけ数字が出る
+    strip = parse_strip(L, home_short, away_short)
+    if strip:
+        sh, sa, finished = strip
+        if hs_ is None or as_ is None:
+            hs_, as_ = sh, sa
+        if finished and period is None:
+            status, period = "試合終了", "FINAL"
+    return Game(key, home_full, away_full, hs_, as_, tip, status, period,
+                home_short, away_short)
+
+
+def parse_strip(L, home_short, away_short):
+    """ページ最上部の速報帯(複数試合が並ぶ)から、この試合の (ホーム点, アウェイ点, 終了済みか) を読む。"""
+    for i in range(len(L) - 3):
+        if (L[i] == home_short and L[i + 1].isdigit() and
+                L[i + 2] == away_short and L[i + 3].isdigit()):
+            h, a = int(L[i + 1]), int(L[i + 3])
+            finished = i > 0 and L[i - 1].startswith("試合終了")
+            if not finished:
+                pat = re.compile(r"^試合終了\s*" + re.escape(home_short))
+                finished = any(pat.match(x) for x in L[i + 4:i + 8])
+            return h, a, finished
+    return None
 
 
 def find_today_game(now):
@@ -377,6 +403,108 @@ def fetch_kings_scorers(game):
         return []
 
 
+# ---------------------------------------------------------------- 試合中のクォーター
+# クォーターや残り時間は公式ページ上でJavaScriptが描くため、ブラウザでページを開いたまま
+# 1分おきに読み直す。(1) 状況表示(例「2Q 05:23」) (2) クォーター別得点の表 の2通りで探す。
+Q_HEAD_RE = re.compile(r"^(?:([1-4])(?:Q|ST|ND|RD|TH)?|第([1-4])Q|(OT|EX|延長)\s*(\d*))$", re.I)
+
+
+def parse_quarter_table(tables, game):
+    """クォーター別得点の表から {"home": [各Q], "away": [各Q], "labels": [...]} を返す。"""
+    hs, as_ = _short_names(game)
+    for t in tables:
+        head = [h.strip().upper() for h in t["head"]]
+        qcols = [(i, h) for i, h in enumerate(head) if Q_HEAD_RE.match(h)]
+        if len([1 for _, h in qcols if not re.match(r"^(OT|EX|延長)", h)]) < 4:
+            continue
+        found = {}
+        for r in t["rows"]:
+            joined = " ".join(r[:2])
+            side = None
+            if any(n and n in joined for n in (game.home, hs)):
+                side = "home"
+            elif any(n and n in joined for n in (game.away, as_)):
+                side = "away"
+            if side and side not in found:
+                found[side] = [_to_int(r[i]) if i < len(r) else None for i, _ in qcols]
+        if len(found) == 2:
+            return {"home": found["home"], "away": found["away"], "labels": [h for _, h in qcols]}
+    return None
+
+
+def _short_names(game):
+    return getattr(game, "home_short", "") or "", getattr(game, "away_short", "") or ""
+
+
+def quarters_played(qt):
+    """表から、得点が入っているクォーターの数を返す(進行中のクォーターを含む)。"""
+    n = 0
+    for i, (h, a) in enumerate(zip(qt["home"], qt["away"])):
+        if h is not None and a is not None and (h + a > 0):
+            n = i + 1
+    return n
+
+
+def q_label(i, labels):
+    lab = labels[i] if i < len(labels) else ""
+    m = Q_HEAD_RE.match(lab)
+    if m and m.group(3):
+        return f"延長{m.group(4) or (i - 3)}"
+    return f"{i + 1}Q"
+
+
+class LivePage:
+    """ブラウザで試合ページを開きっぱなしにして、描画後の状況を読む。"""
+
+    def __init__(self, game):
+        self.game = game
+        self.pw = self.browser = self.page = None
+
+    def _open(self):
+        _ensure_browser()
+        from playwright.sync_api import sync_playwright
+        self.pw = sync_playwright().start()
+        self.browser = self.pw.chromium.launch()
+        self.page = self.browser.new_page(user_agent=HEADERS["User-Agent"], locale="ja-JP")
+        self.page.goto(DETAIL_URL.format(key=self.game.key), wait_until="networkidle", timeout=60000)
+
+    def read(self):
+        """(状況表示から読んだクォーター, クォーター別得点の表) を返す。読めなければ None。"""
+        try:
+            if self.page is None:
+                self._open()
+            else:
+                self.page.reload(wait_until="networkidle", timeout=45000)
+            self.page.wait_for_timeout(1500)
+            html = self.page.content()
+            tables = self.page.evaluate(TABLES_JS)
+        except Exception as e:
+            print(f"[live] 読み取り失敗: {e}")
+            self.close()
+            return None, None
+        period = None
+        try:
+            period = parse_game(self.game.key, html).period
+            if period == "FINAL":
+                period = None  # 終了判定は速報帯/見出しに任せる
+        except Exception as e:
+            print(f"[live] 状況表示を解析できず: {e}")
+        qt = parse_quarter_table(tables, self.game)
+        print(f"[live] period={period} table={qt}")
+        return period, qt
+
+    def close(self):
+        for x in (self.browser, self.pw):
+            try:
+                if x is self.pw and x:
+                    x.stop()
+                elif x:
+                    x.close()
+            except Exception:
+                pass
+        self.pw = self.browser = self.page = None
+
+
 # ---------------------------------------------------------------- スターティング5
 STARTER_KEYS = ("StartingFlg", "StartFlg", "StartingFlag", "Starter", "IsStarter",
                 "Starting", "StarterFlag", "Start", "GS", "starter", "is_starter")
@@ -530,6 +658,27 @@ def label(p):
 
 
 # ---------------------------------------------------------------- 見張りループ
+LIVE_READ_SEC = 60   # 描画後のページ(クォーター情報)を読み直す間隔
+
+
+def score_text(g, h, a):
+    k, o = (h, a) if g.kings_home else (a, h)
+    return f"琉球 {k} - {o} {g.opp}"
+
+
+def period_index(p):
+    """Q1..Q4, OTn を 0始まりの番号に。HALF は2Qの終わり扱い。"""
+    if not p:
+        return None
+    if p == "HALF":
+        return 1
+    if p.startswith("Q"):
+        return int(p[1:]) - 1
+    if p.startswith("OT"):
+        return 3 + int(p[2:] or 1)
+    return None
+
+
 def watch(game):
     global CURRENT_KEY
     CURRENT_KEY = game.key
@@ -545,94 +694,153 @@ def watch(game):
     last_fallback = None
     errors = 0
     warned = False
+    live = LivePage(game)
+    last_live = None
+    live_period, qt = None, None
+    ended = set()          # 終了を通知済みのクォーター(0始まり)
 
-    while datetime.now(JST) - started_at < MAX_RUN:
-        try:
-            g = parse_game(game.key, fetch(DETAIL_URL.format(key=game.key)))
-            errors = 0
-        except Exception as e:
-            errors += 1
-            print(f"[error] {e}")
-            if errors >= 10 and not warned:
-                notify("⚠️ 速報の取得に失敗中", "公式ページを読み取れていません。ページの作りが変わった可能性があります。",
-                       tags="warning")
-                warned = True
-            time.sleep(POLL_SEC)
-            continue
+    def announce_end(g, idx):
+        if idx in ended or idx < 0:
+            return
+        ended.add(idx)
+        labels = qt["labels"] if qt else []
+        name = q_label(idx, labels)
+        half = "(ハーフタイム)" if idx == 1 else ""
+        body = g.scoreline()
+        if qt and len(qt["home"]) > idx and all(
+                x is not None for x in qt["home"][:idx + 1] + qt["away"][:idx + 1]):
+            h, a = sum(qt["home"][:idx + 1]), sum(qt["away"][:idx + 1])
+            qh, qa = qt["home"][idx], qt["away"][idx]
+            qk, qo = (qh, qa) if g.kings_home else (qa, qh)
+            body = f"{score_text(g, h, a)}\n{name}だけ: 琉球 {qk} - {qo}"
+        rows = fetch_kings_scorers(g)
+        save_status(g, rows)
+        sc = scorers_text(rows, top=3)
+        if sc:
+            body += "\n" + sc
+        notify(f"{name}終了{half}", body)
 
-        now = datetime.now(JST)
-        print(f"{now:%H:%M:%S} status={g.status!r} period={g.period} "
-              f"{g.home_score}-{g.away_score}")
+    try:
+        while datetime.now(JST) - started_at < MAX_RUN:
+            try:
+                g = parse_game(game.key, fetch(DETAIL_URL.format(key=game.key)))
+                errors = 0
+            except Exception as e:
+                errors += 1
+                print(f"[error] {e}")
+                if errors >= 10 and not warned:
+                    notify("⚠️ 速報の取得に失敗中",
+                           "公式ページを読み取れていません。ページの作りが変わった可能性があります。",
+                           tags="warning")
+                    warned = True
+                time.sleep(POLL_SEC)
+                continue
 
-        if not g.started:
-            if g.tipoff and now > g.tipoff + timedelta(hours=4):
-                print("開始が確認できないまま4時間経過。終了。")
+            now = datetime.now(JST)
+            print(f"{now:%H:%M:%S} status={g.status!r} period={g.period} "
+                  f"{g.home_score}-{g.away_score}")
+
+            if not g.started:
+                if g.tipoff and now > g.tipoff + timedelta(hours=4):
+                    print("開始が確認できないまま4時間経過。終了。")
+                    return
+                # 開始前: 2分おきに最大3回、スタメンが出ていないか確認
+                if (not starters_sent and starter_tries < 3 and
+                        (last_starter_try is None or now - last_starter_try >= timedelta(minutes=2))):
+                    starter_tries += 1
+                    last_starter_try = now
+                    names = fetch_kings_starters(g)
+                    if names:
+                        tip = f"{g.tipoff:%H:%M} TIP OFF" if g.tipoff else ""
+                        notify("📋 キングス スタメン", f"vs {g.opp}  {tip}\n" + " / ".join(names))
+                        starters_sent = True
+                prev = g
+                time.sleep(POLL_SEC)
+                continue
+
+            if g.period == "FINAL":
+                if prev is None or prev.period != "FINAL":
+                    win = g.kings_pts > g.opp_pts
+                    body = f"FINAL  {g.scoreline()}"
+                    _, q_final = live.read()  # 最終クォーターまで埋まった表を読み直す
+                    if q_final:
+                        qt = q_final
+                    if qt:
+                        parts = []
+                        for i, (h, a) in enumerate(zip(qt["home"], qt["away"])):
+                            if h is None or a is None or (i >= 4 and h + a == 0):
+                                continue
+                            k, o = (h, a) if g.kings_home else (a, h)
+                            parts.append(f"{q_label(i, qt['labels'])} {k}-{o}")
+                        if parts:
+                            body += "\n" + " / ".join(parts)
+                    rows = fetch_kings_scorers(g)
+                    save_status(g, rows)
+                    sc = scorers_text(rows)
+                    if sc:
+                        body += "\n" + sc
+                    notify("🏆 勝利!" if win else "試合終了", body,
+                           tags="trophy" if win else "basketball", priority="high")
                 return
-            # 開始前: 2分おきに最大3回、スタメンが出ていないか確認
-            if (not starters_sent and starter_tries < 3 and
-                    (last_starter_try is None or now - last_starter_try >= timedelta(minutes=2))):
-                starter_tries += 1
-                last_starter_try = now
-                names = fetch_kings_starters(g)
-                if names:
-                    tip = f"{g.tipoff:%H:%M} TIP OFF" if g.tipoff else ""
-                    notify("📋 キングス スタメン", f"vs {g.opp}  {tip}\n" + " / ".join(names))
-                    starters_sent = True
+
+            # 描画後のページからクォーター情報を読む(1分おき)
+            if last_live is None or (now - last_live).total_seconds() >= LIVE_READ_SEC:
+                last_live = now
+                p_r, q_r = live.read()
+                if p_r:
+                    live_period = p_r
+                if q_r:
+                    qt = q_r
+            played = quarters_played(qt) if qt else 0
+            g.period = g.period or live_period or (f"Q{played}" if 1 <= played <= 4 else
+                                                    f"OT{played - 4}" if played > 4 else None)
+
+            if prev is None or not prev.started:
+                first = prev is not None  # 開始前から見ていたなら「ティップオフ」
+                body = f"vs {g.opp}" + ("" if first else f"  {label(g.period) or ''}  {g.scoreline()}")
+                if not starters_sent:  # 開始前に読めなかった場合はここで添える
+                    names = fetch_kings_starters(g)
+                    if names:
+                        body += "\nスタメン: " + " / ".join(names)
+                        starters_sent = True
+                notify("🏀 ティップオフ!" if first else "🏀 試合中", body)
+                last_fallback = now
+                save_status(g)
+                # 途中から見始めた場合、すでに終わったクォーターは通知しない
+                cur = period_index(g.period)
+                if cur is not None:
+                    ended.update(range(cur if g.period != "HALF" else 2))
+            else:
+                # クォーター終了: 状況表示の変化、またはクォーター別得点の表に次のQが出たとき
+                pi_prev, pi_now = period_index(prev.period), period_index(g.period)
+                if g.period == "HALF":
+                    announce_end(g, 1)
+                elif pi_prev is not None and pi_now is not None and pi_now > pi_prev:
+                    for i in range(pi_prev, pi_now):
+                        announce_end(g, i)
+                if played >= 2:
+                    for i in range(played - 1):
+                        announce_end(g, i)
+                if g.period or ended:
+                    last_fallback = now
+                # 4Q・延長の逆転/同点
+                clutch = g.period in ("Q4",) or (g.period or "").startswith("OT")
+                if clutch and g.leader() != prev.leader():
+                    msg = {"kings": "🔥 キングス逆転!" if prev.leader() == "opp" else "🔥 キングス勝ち越し!",
+                           "opp": "😱 逆転された…" if prev.leader() == "kings" else "😱 勝ち越された…",
+                           "tie": "⚖️ 同点!"}[g.leader()]
+                    notify(msg, f"{label(g.period)}  {g.scoreline()}", priority="high")
+                # クォーターがまったく読めない場合の保険
+                if g.period is None and not ended and (
+                        last_fallback is None or
+                        now - last_fallback >= timedelta(minutes=FALLBACK_UPDATE_MIN)):
+                    notify("スコア更新", g.scoreline(), priority="low")
+                    last_fallback = now
+
             prev = g
             time.sleep(POLL_SEC)
-            continue
-
-        if g.period == "FINAL":
-            if prev is None or prev.period != "FINAL":
-                win = g.kings_pts > g.opp_pts
-                body = f"FINAL  {g.scoreline()}"
-                rows = fetch_kings_scorers(g)
-                save_status(g, rows)
-                sc = scorers_text(rows)
-                if sc:
-                    body += "\n" + sc
-                notify("🏆 勝利!" if win else "試合終了", body,
-                       tags="trophy" if win else "basketball", priority="high")
-            return
-
-        if prev is None or not prev.started:
-            first = prev is not None  # 開始前から見ていたなら「ティップオフ」
-            body = f"vs {g.opp}" + ("" if first else f"  {label(g.period) or ''}  {g.scoreline()}")
-            if not starters_sent:  # 開始前に読めなかった場合はここで添える
-                names = fetch_kings_starters(g)
-                if names:
-                    body += "\nスタメン: " + " / ".join(names)
-                    starters_sent = True
-            notify("🏀 ティップオフ!" if first else "🏀 試合中", body)
-            last_fallback = now
-            save_status(g)
-        else:
-            # クォーター終了
-            if g.period and prev.period and g.period != prev.period and prev.period != "HALF":
-                extra = "(ハーフタイム)" if g.period == "HALF" else ""
-                body = g.scoreline()
-                rows = fetch_kings_scorers(g)
-                save_status(g, rows)
-                sc = scorers_text(rows, top=3)
-                if sc:
-                    body += "\n" + sc
-                notify(f"{label(prev.period)}終了{extra}", body)
-                last_fallback = now
-            # 4Q・延長の逆転/同点
-            clutch = g.period in ("Q4",) or (g.period or "").startswith("OT")
-            if clutch and g.leader() != prev.leader():
-                t = {"kings": "🔥 キングス逆転!" if prev.leader() == "opp" else "🔥 キングス勝ち越し!",
-                     "opp": "😱 逆転された…" if prev.leader() == "kings" else "😱 勝ち越された…",
-                     "tie": "⚖️ 同点!"}[g.leader()]
-                notify(t, f"{label(g.period)}  {g.scoreline()}", priority="high")
-            # クォーターが読めない場合の保険
-            if g.period is None and (last_fallback is None or
-                                     now - last_fallback >= timedelta(minutes=FALLBACK_UPDATE_MIN)):
-                notify("スコア更新", g.scoreline(), priority="low")
-                last_fallback = now
-
-        prev = g
-        time.sleep(POLL_SEC)
+    finally:
+        live.close()
 
 
 def main():
