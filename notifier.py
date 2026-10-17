@@ -4,7 +4,7 @@ GitHub Actions から1時間おきに起動される。
 - 今日キングスの試合があれば、試合開始5分前から終了まで30秒おきにスコアを確認
   (試合中のスコアはページ最上部の速報帯から、クォーターはブラウザで描画したページから読む)
 - ティップオフ / 各クォーター終了 / 4Q・延長の逆転・同点 / 試合終了 を ntfy に送る
-- 試合開始前(またはティップオフ時)にキングスのスターティング5を送る
+- 試合開始前(またはティップオフ時)にキングスのスターティング5とベンチ入りの選手を送る
 - クォーター終了時はキングスの得点上位3人、試合終了時は得点した全員の得点を添える
 
 手動テスト:
@@ -580,16 +580,86 @@ def starters_from_tables(tables, game):
     return cands[idx][1] if len(cands) > idx else []
 
 
-def fetch_kings_starters(game):
-    """キングスの先発5人の名前を返す。まだ発表されていない・読めない時は空リスト。"""
+# ---------------------------------------------------------------- ベンチ入り(その試合の登録選手)
+STAT_HEADS = ("PTS", "MIN", "得点", "出場時間", "FGM", "REB")
+
+
+def roster_from_json(blobs):
+    out = []
+    for blob in blobs:
+        for d in _walk_json(blob):
+            nk = next((k for k in NAME_KEYS if isinstance(d.get(k), str) and d.get(k)), None)
+            if not nk:
+                continue
+            team = next((str(d[k]) for k in TEAM_KEYS if k in d), None)
+            if team == str(KINGS_ID) and not any(w in d[nk] for w in TOTAL_WORDS):
+                out.append(d[nk].strip())
+    out = list(dict.fromkeys(out))
+    return out if 8 <= len(out) <= 15 else []
+
+
+def roster_from_tables(tables, game):
+    """ボックススコアのキングスの表から、その試合に登録された選手の名前を全員分読む。"""
+    cands = []
+    for t in tables:
+        head = [h.strip().upper() for h in t["head"]]
+        if not any(h in STAT_HEADS for h in head):
+            continue
+        ni = next((i for i, h in enumerate(head) if any(w in h for w in ("選手", "PLAYER", "NAME"))), None)
+        names = []
+        for r in t["rows"]:
+            if not r or any(w in " ".join(r) for w in TOTAL_WORDS):
+                continue
+            if ni is not None and ni < len(r):
+                name = r[ni].strip()
+            else:
+                name = next((c.strip() for c in r if len(c.strip()) > 1
+                             and not re.fullmatch(r"[\d.%:/\-#]+", c.strip())
+                             and c.strip() not in MARKS), "")
+            if name:
+                names.append(name)
+        names = list(dict.fromkeys(names))
+        if 8 <= len(names) <= 15:
+            cands.append((t.get("before", ""), names))
+    if not cands:
+        return []
+
+    def kings_score(before):
+        k = max(before.rfind("琉球"), before.rfind("キングス"))
+        o = max(before.rfind(game.opp), before.rfind(_short(game.opp)))
+        return k - o
+    mine = [n for before, n in cands if kings_score(before) > 0]
+    if mine:
+        return mine[0]
+    idx = 0 if game.kings_home else 1
+    return cands[idx][1] if len(cands) > idx else []
+
+
+def fetch_kings_lineup(game):
+    """(先発5人, ベンチ入りの選手) を返す。読めない部分は空リスト。"""
     try:
         blobs, tables = load_boxscore(game)
-        names = starters_from_json(blobs) or starters_from_tables(tables, game)
-        print(f"[starters] {names}")
-        return names
+        starters = starters_from_json(blobs) or starters_from_tables(tables, game)
+        roster = roster_from_json(blobs) or roster_from_tables(tables, game)
+        bench = [n for n in roster if n not in starters] if starters else roster
+        print(f"[lineup] starters={starters} bench={bench}")
+        return starters, bench
     except Exception as e:
-        print(f"[starters] 取得失敗: {e}")
-        return []
+        print(f"[lineup] 取得失敗: {e}")
+        return [], []
+
+
+def fetch_kings_starters(game):
+    return fetch_kings_lineup(game)[0]
+
+
+def lineup_text(starters, bench):
+    lines = []
+    if starters:
+        lines.append("スタメン: " + " / ".join(starters))
+    if bench:
+        lines.append(("ベンチ: " if starters else f"ベンチ入り({len(bench)}人): ") + " / ".join(bench))
+    return "\n".join(lines)
 
 
 def scorers_text(rows, top=None):
@@ -749,10 +819,11 @@ def watch(game):
                         (last_starter_try is None or now - last_starter_try >= timedelta(minutes=2))):
                     starter_tries += 1
                     last_starter_try = now
-                    names = fetch_kings_starters(g)
-                    if names:
+                    starters, bench = fetch_kings_lineup(g)
+                    if starters:
                         tip = f"{g.tipoff:%H:%M} TIP OFF" if g.tipoff else ""
-                        notify("📋 キングス スタメン", f"vs {g.opp}  {tip}\n" + " / ".join(names))
+                        notify("📋 キングス スタメン",
+                               f"vs {g.opp}  {tip}\n" + lineup_text(starters, bench))
                         starters_sent = True
                 prev = g
                 time.sleep(POLL_SEC)
@@ -799,9 +870,10 @@ def watch(game):
                 first = prev is not None  # 開始前から見ていたなら「ティップオフ」
                 body = f"vs {g.opp}" + ("" if first else f"  {label(g.period) or ''}  {g.scoreline()}")
                 if not starters_sent:  # 開始前に読めなかった場合はここで添える
-                    names = fetch_kings_starters(g)
-                    if names:
-                        body += "\nスタメン: " + " / ".join(names)
+                    starters, bench = fetch_kings_lineup(g)
+                    lt = lineup_text(starters, bench)
+                    if lt:
+                        body += "\n" + lt
                         starters_sent = True
                 notify("🏀 ティップオフ!" if first else "🏀 試合中", body)
                 last_fallback = now
@@ -854,7 +926,7 @@ def main():
 
     if args[:1] == ["--starters"]:
         g = parse_game(args[1], fetch(DETAIL_URL.format(key=args[1])))
-        print(" / ".join(fetch_kings_starters(g)) or "スタメンを読み取れませんでした")
+        print(lineup_text(*fetch_kings_lineup(g)) or "スタメン・ベンチ入りを読み取れませんでした")
         return
 
     if args[:1] == ["--box"]:
