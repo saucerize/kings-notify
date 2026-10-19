@@ -373,13 +373,14 @@ def load_boxscore(game):
                 except Exception:
                     pass
         page.on("response", on_resp)
-        page.goto(DETAIL_URL.format(key=game.key), wait_until="networkidle", timeout=60000)
+        page.goto(DETAIL_URL.format(key=game.key), wait_until="domcontentloaded", timeout=60000)
+        page.wait_for_timeout(6000)
         for label_text in ("ボックススコア", "BOX SCORE", "BOXSCORE"):
             loc = page.get_by_text(label_text, exact=True)
             if loc.count():
                 try:
                     loc.first.click(timeout=5000)
-                    page.wait_for_load_state("networkidle", timeout=20000)
+                    page.wait_for_timeout(4000)
                 except Exception:
                     pass
                 break
@@ -453,12 +454,38 @@ def q_label(i, labels):
     return f"{i + 1}Q"
 
 
+CLOCK_RE = re.compile(r"^\d{1,2}:\d{2}(\.\d)?$")
+PERIOD_LINE_RE = re.compile(r"^(?:([1-4])\s*(?:Q|ST|ND|RD|TH)|第\s*([1-4])\s*Q|(?:OT|延長)\s*(\d*))"
+                            r"(?:\s+(\d{1,2}:\d{2}(?:\.\d)?))?$", re.I)
+
+
+def period_from_text(text):
+    """描画後のページの文字から「3Q 05:12」のような、残り時間付きのクォーター表示を探す。
+    残り時間が付いていない「1Q」(クォーター別得点の見出しなど)は使わない。"""
+    lines = [l.strip() for l in (text or "").split("\n") if l.strip()]
+    for i, l in enumerate(lines):
+        if re.fullmatch(r"(HALF\s*TIME|ハーフタイム)", l, re.I):
+            return "HALF"
+        m = PERIOD_LINE_RE.match(l)
+        if not m:
+            continue
+        has_clock = m.group(4) or (i + 1 < len(lines) and CLOCK_RE.match(lines[i + 1]))
+        if not has_clock:
+            continue
+        if m.group(1) or m.group(2):
+            return f"Q{m.group(1) or m.group(2)}"
+        return f"OT{m.group(3) or 1}"
+    return None
+
+
 class LivePage:
     """ブラウザで試合ページを開きっぱなしにして、描画後の状況を読む。"""
 
     def __init__(self, game):
         self.game = game
         self.pw = self.browser = self.page = None
+        self.misses = 0
+        self.diag_sent = False
 
     def _open(self):
         _ensure_browser()
@@ -466,7 +493,7 @@ class LivePage:
         self.pw = sync_playwright().start()
         self.browser = self.pw.chromium.launch()
         self.page = self.browser.new_page(user_agent=HEADERS["User-Agent"], locale="ja-JP")
-        self.page.goto(DETAIL_URL.format(key=self.game.key), wait_until="networkidle", timeout=60000)
+        self.page.goto(DETAIL_URL.format(key=self.game.key), wait_until="domcontentloaded", timeout=60000)
 
     def read(self):
         """(状況表示から読んだクォーター, クォーター別得点の表) を返す。読めなければ None。"""
@@ -474,8 +501,8 @@ class LivePage:
             if self.page is None:
                 self._open()
             else:
-                self.page.reload(wait_until="networkidle", timeout=45000)
-            self.page.wait_for_timeout(1500)
+                self.page.reload(wait_until="domcontentloaded", timeout=45000)
+            self.page.wait_for_timeout(6000)
             html = self.page.content()
             tables = self.page.evaluate(TABLES_JS)
         except Exception as e:
@@ -490,8 +517,34 @@ class LivePage:
         except Exception as e:
             print(f"[live] 状況表示を解析できず: {e}")
         qt = parse_quarter_table(tables, self.game)
+        if period is None:
+            try:
+                period = period_from_text(self.page.evaluate("() => document.body.innerText"))
+            except Exception:
+                pass
         print(f"[live] period={period} table={qt}")
+        if period is None and qt is None:
+            self.misses += 1
+            if self.misses == 3 and not self.diag_sent:
+                self.diag_sent = True
+                notify("🔧 診断用(このままClaudeに送ってください)", self._diag(tables), priority="low")
         return period, qt
+
+    def _diag(self, tables):
+        """クォーター表示を探すための手がかり(描画後の文字と表の見出し)をまとめる。"""
+        try:
+            text = self.page.evaluate("() => document.body.innerText")
+        except Exception:
+            text = ""
+        lines = [l.strip() for l in text.split("\n") if l.strip()]
+        keys = ("スコアチャート", "ゲームスコア", "試合中", "Q", "TIP OFF")
+        pick = []
+        for i, l in enumerate(lines):
+            if any(k in l for k in keys):
+                pick.append(" | ".join(lines[max(0, i - 3):i + 4]))
+        heads = [" ".join(t["head"])[:80] for t in tables[:8]]
+        out = "[text]\n" + "\n".join(dict.fromkeys(pick))[:2200] + "\n[tables]\n" + "\n".join(heads)
+        return out[:3500]
 
     def close(self):
         for x in (self.browser, self.pw):
@@ -906,7 +959,7 @@ def watch(game):
                 if g.period is None and not ended and (
                         last_fallback is None or
                         now - last_fallback >= timedelta(minutes=FALLBACK_UPDATE_MIN)):
-                    notify("スコア更新", g.scoreline(), priority="low")
+                    notify("スコア更新", g.scoreline())
                     last_fallback = now
 
             prev = g
