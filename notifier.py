@@ -41,10 +41,18 @@ HEADERS = {"User-Agent": "kings-score-notifier (personal use)"}
 
 
 # ---------------------------------------------------------------- 取得・解析
-def fetch(url):
-    r = requests.get(url, headers=HEADERS, timeout=20)
-    r.raise_for_status()
-    return r.text
+def fetch(url, tries=4):
+    """公式サイトの読み込み。一時的な失敗(混雑・通信切れ)なら少し待ってやり直す。"""
+    for i in range(tries):
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=20)
+            r.raise_for_status()
+            return r.text
+        except Exception as e:
+            if i == tries - 1:
+                raise
+            print(f"[fetch] 失敗、やり直します({i + 1}/{tries - 1}): {e}")
+            time.sleep(5 * (i + 1))
 
 
 def text_lines(html):
@@ -1001,7 +1009,18 @@ def main():
         notify("✅ キングス速報 テスト", body)
         return
 
-    g = find_today_game(now)
+    g = None
+    for i in range(6):  # 日程が読めない時は最大5分ほどやり直す
+        try:
+            g = find_today_game(now)
+            break
+        except Exception as e:
+            print(f"[main] 日程の取得に失敗、やり直します: {e}")
+            time.sleep(60)
+    else:
+        notify("⚠️ 日程を読み込めませんでした", "公式サイトに接続できませんでした。次の起動でもう一度試します。",
+               tags="warning")
+        return
     if not g:
         print("今日のキングスの試合なし")
         return
