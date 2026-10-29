@@ -6,6 +6,7 @@ GitHub Actions から1時間おきに起動される。
 - ティップオフ / 各クォーター終了 / 4Q・延長の逆転・同点 / 試合終了 を ntfy に送る
 - 試合開始前(またはティップオフ時)にキングスのスターティング5とベンチ入りの選手を送る
 - クォーター終了時はキングスの得点上位3人、試合終了時は得点した全員の得点を添える
+- 試合中のスコアと選手別得点を、Webページ(kings-next-game)用の ntfy トピックにも流す
 
 手動テスト:
   python notifier.py --test            # テスト通知を送り、次の試合を表示
@@ -30,12 +31,16 @@ SCHEDULE_URL = BASE + "/schedule/?tab=1&club={club}"
 DETAIL_URL = BASE + "/game_detail/?ScheduleKey={key}&tab=1"
 NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "").strip()
 NTFY_SERVER = os.environ.get("NTFY_SERVER", "https://ntfy.sh").rstrip("/")
+# Webページが読む試合中の状況。ページから読むので公開のトピック(通知用とは別)
+LIVE_TOPIC = os.environ.get("NTFY_LIVE_TOPIC", "kings-live-a38853caea").strip()
 
 POLL_SEC = 30
 START_WINDOW_MIN = 75         # この時間内に試合があれば、その起動で待機して担当する
 WATCH_LEAD_MIN = 5            # 見張りを始めるのは試合開始の何分前か
 MAX_RUN = timedelta(hours=5, minutes=40)  # GitHub Actions の6時間制限より手前で止める
 FALLBACK_UPDATE_MIN = 15      # クォーターが読み取れない時の定期スコア通知間隔
+LIVE_PUSH_SEC = 60            # Webページ用の状況を送る最短間隔(ntfy の送信回数制限に配慮)
+BOX_RETRY_MIN = 3             # 選手別得点が読めない時、ボックススコアを開き直す間隔
 
 HEADERS = {"User-Agent": "kings-score-notifier (personal use)"}
 
@@ -494,6 +499,15 @@ class LivePage:
         self.pw = self.browser = self.page = None
         self.misses = 0
         self.diag_sent = False
+        self.blobs = []
+        self.scorers = []   # 直近の読み取りで分かったキングスの選手別得点
+
+    def _on_resp(self, resp):
+        if "json" in (resp.headers.get("content-type") or ""):
+            try:
+                self.blobs.append(resp.json())
+            except Exception:
+                pass
 
     def _open(self):
         _ensure_browser()
@@ -501,10 +515,12 @@ class LivePage:
         self.pw = sync_playwright().start()
         self.browser = self.pw.chromium.launch()
         self.page = self.browser.new_page(user_agent=HEADERS["User-Agent"], locale="ja-JP")
+        self.page.on("response", self._on_resp)
         self.page.goto(DETAIL_URL.format(key=self.game.key), wait_until="domcontentloaded", timeout=60000)
 
     def read(self):
         """(状況表示から読んだクォーター, クォーター別得点の表) を返す。読めなければ None。"""
+        self.blobs = []
         try:
             if self.page is None:
                 self._open()
@@ -525,6 +541,12 @@ class LivePage:
         except Exception as e:
             print(f"[live] 状況表示を解析できず: {e}")
         qt = parse_quarter_table(tables, self.game)
+        try:
+            rows = players_from_json(self.blobs) or players_from_tables(tables, self.game)
+            self.scorers = sorted([(n, p) for n, p in rows if p > 0], key=lambda x: -x[1])
+        except Exception as e:
+            print(f"[live] 選手別得点を解析できず: {e}")
+            self.scorers = []
         if period is None:
             try:
                 period = period_from_text(self.page.evaluate("() => document.body.innerText"))
@@ -780,6 +802,54 @@ def save_status(g, scorers=None):
         print(f"[status] 保存失敗: {e}")
 
 
+def valid_scorers(rows, g):
+    """選手別得点がスコアと矛盾しないか(合計がチーム得点を超えていないか)。"""
+    if not rows:
+        return False
+    return g.kings_pts is None or sum(p for _, p in rows) <= g.kings_pts
+
+
+_live_last = {"payload": None, "at": None}
+
+
+def publish_live(g, qt=None, scorers=None, force=False):
+    """Webページ(kings-next-game)用に、試合中の状況を ntfy の公開トピックへ送る。
+    内容が変わったときだけ、最短 LIVE_PUSH_SEC 秒おきに送る(クォーターが変わった時と force はすぐ送る)。"""
+    import json
+    if not LIVE_TOPIC:
+        return
+    quarters = None
+    if qt:
+        quarters = []
+        for i, (h, a) in enumerate(zip(qt["home"], qt["away"])):
+            if h is None or a is None or (i >= 4 and h + a == 0):
+                continue
+            k, o = (h, a) if g.kings_home else (a, h)
+            quarters.append([q_label(i, qt["labels"]), k, o])
+    payload = {
+        "type": "kings-live", "v": 1, "key": g.key,
+        "datetime": g.tipoff.isoformat() if g.tipoff else None,
+        "opponent": g.opp, "home": g.kings_home,
+        "kings": g.kings_pts, "opp": g.opp_pts, "period": g.period,
+        "quarters": quarters, "scorers": [[n, p] for n, p in (scorers or [])],
+    }
+    last, at = _live_last["payload"], _live_last["at"]
+    now = datetime.now(JST)
+    if payload == last:
+        return
+    period_changed = last is None or last.get("period") != payload["period"]
+    if not (force or period_changed or at is None or (now - at).total_seconds() >= LIVE_PUSH_SEC):
+        return
+    body = json.dumps(dict(payload, updated=now.isoformat(timespec="seconds")), ensure_ascii=False)
+    try:
+        requests.post(f"{NTFY_SERVER}/{LIVE_TOPIC}", data=body.encode("utf-8"),
+                      headers={"Content-Type": "application/json"}, timeout=15).raise_for_status()
+        _live_last["payload"], _live_last["at"] = payload, now
+        print(f"[live-push] {g.period} {g.kings_pts}-{g.opp_pts} scorers={len(payload['scorers'])}")
+    except Exception as e:
+        print(f"[live-push] 送信失敗: {e}")
+
+
 CURRENT_KEY = None
 PERIOD_LABEL = {"Q1": "1Q", "Q2": "2Q", "Q3": "3Q", "Q4": "4Q"}
 
@@ -829,8 +899,11 @@ def watch(game):
     last_live = None
     live_period, qt = None, None
     ended = set()          # 終了を通知済みのクォーター(0始まり)
+    scorers = []           # Webページに出すキングスの選手別得点
+    last_box = None
 
     def announce_end(g, idx):
+        nonlocal scorers
         if idx in ended or idx < 0:
             return
         ended.add(idx)
@@ -845,6 +918,8 @@ def watch(game):
             qk, qo = (qh, qa) if g.kings_home else (qa, qh)
             body = f"{score_text(g, h, a)}\n{name}だけ: 琉球 {qk} - {qo}"
         rows = fetch_kings_scorers(g)
+        if valid_scorers(rows, g):
+            scorers = rows
         save_status(g, rows)
         sc = scorers_text(rows, top=3)
         if sc:
@@ -907,6 +982,7 @@ def watch(game):
                         if parts:
                             body += "\n" + " / ".join(parts)
                     rows = fetch_kings_scorers(g)
+                    publish_live(g, qt, rows if valid_scorers(rows, g) else scorers, force=True)
                     save_status(g, rows)
                     sc = scorers_text(rows)
                     if sc:
@@ -923,6 +999,14 @@ def watch(game):
                     live_period = p_r
                 if q_r:
                     qt = q_r
+                if valid_scorers(live.scorers, g):
+                    scorers = live.scorers
+                elif last_box is None or now - last_box >= timedelta(minutes=BOX_RETRY_MIN):
+                    # 開きっぱなしのページから読めない時は、ボックススコアを開いて読む
+                    last_box = now
+                    rows = fetch_kings_scorers(g)
+                    if valid_scorers(rows, g):
+                        scorers = rows
             played = quarters_played(qt) if qt else 0
             g.period = g.period or live_period or (f"Q{played}" if 1 <= played <= 4 else
                                                     f"OT{played - 4}" if played > 4 else None)
@@ -970,6 +1054,7 @@ def watch(game):
                     notify("スコア更新", g.scoreline())
                     last_fallback = now
 
+            publish_live(g, qt, scorers)
             prev = g
             time.sleep(POLL_SEC)
     finally:
