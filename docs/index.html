@@ -1,0 +1,228 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#0b0b0b">
+  <title>キングス 次の試合</title>
+  <style>
+    :root {
+      --bg: #0b0b0b;
+      --card: #161411;
+      --line: #3a3120;
+      --gold: #d4af37;
+      --gold-soft: #f1d77a;
+      --text: #f5f1e6;
+      --muted: #a39c8a;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; }
+    body {
+      min-height: 100vh;
+      min-height: 100dvh;
+      background: radial-gradient(120% 60% at 50% 0%, #2a2210 0%, var(--bg) 60%) fixed, var(--bg);
+      color: var(--text);
+      font-family: "Hiragino Sans", "Noto Sans JP", "Yu Gothic", system-ui, sans-serif;
+      line-height: 1.5;
+      padding: max(20px, env(safe-area-inset-top)) 16px max(24px, env(safe-area-inset-bottom));
+    }
+    main { max-width: 480px; margin: 0 auto; }
+
+    header { text-align: center; margin-bottom: 20px; }
+    .team {
+      margin: 0;
+      font-size: 13px;
+      letter-spacing: .2em;
+      color: var(--gold);
+    }
+    h1 {
+      margin: 4px 0 0;
+      font-size: 28px;
+      font-weight: 800;
+      letter-spacing: .08em;
+      background: linear-gradient(180deg, var(--gold-soft), var(--gold));
+      -webkit-background-clip: text;
+      background-clip: text;
+      color: transparent;
+    }
+
+    .card {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      padding: 24px 20px;
+      box-shadow: 0 10px 30px rgba(0,0,0,.5), inset 0 1px 0 rgba(212,175,55,.15);
+    }
+    .badge {
+      display: inline-block;
+      padding: 4px 14px;
+      border-radius: 999px;
+      font-size: 13px;
+      font-weight: 700;
+      letter-spacing: .1em;
+    }
+    .badge.home { background: var(--gold); color: #111; }
+    .badge.away { border: 1px solid var(--gold); color: var(--gold); }
+    .top { display: flex; justify-content: space-between; align-items: center; }
+    .live {
+      font-size: 13px; font-weight: 700; color: #ff5a5a;
+      animation: blink 1.2s infinite;
+    }
+    @keyframes blink { 50% { opacity: .35; } }
+
+    .vs { margin: 20px 0 4px; font-size: 14px; color: var(--muted); }
+    .opponent { margin: 0; font-size: 26px; font-weight: 800; }
+
+    dl { margin: 20px 0 0; display: grid; grid-template-columns: auto 1fr; gap: 10px 16px; }
+    dt { color: var(--gold); font-size: 13px; padding-top: 2px; }
+    dd { margin: 0; font-size: 17px; font-weight: 600; }
+
+    .countdown {
+      margin-top: 24px;
+      padding-top: 20px;
+      border-top: 1px solid var(--line);
+      text-align: center;
+    }
+    .countdown .label { font-size: 13px; color: var(--muted); }
+    .units { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-top: 10px; }
+    .unit {
+      background: #0f0e0b;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 10px 0 6px;
+    }
+    .num {
+      display: block;
+      font-size: 30px;
+      font-weight: 800;
+      color: var(--gold-soft);
+      font-variant-numeric: tabular-nums;
+    }
+    .unit small { font-size: 11px; color: var(--muted); }
+
+    h2 { margin: 28px 0 10px; font-size: 14px; color: var(--gold); letter-spacing: .1em; }
+    .later { list-style: none; margin: 0; padding: 0; }
+    .later li {
+      display: flex; justify-content: space-between; gap: 12px;
+      padding: 12px 4px;
+      border-bottom: 1px solid var(--line);
+      font-size: 15px;
+    }
+    .later .ha { color: var(--gold); font-size: 13px; white-space: nowrap; }
+
+    .message { text-align: center; color: var(--muted); padding: 40px 0; }
+    .note { margin-top: 24px; text-align: center; font-size: 12px; color: var(--muted); }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <p class="team">RYUKYU GOLDEN KINGS</p>
+      <h1>NEXT GAME</h1>
+    </header>
+    <div id="app"><p class="message">読み込み中…</p></div>
+    <p class="note" id="note"></p>
+  </main>
+
+  <script>
+    // 試合開始からこの時間が過ぎたら「終わった試合」とみなして次へ進む
+    const GAME_LENGTH_MS = 2.5 * 60 * 60 * 1000;
+    const TZ = "Asia/Tokyo";
+
+    const app = document.getElementById("app");
+    let timer = null;
+
+    const fmtDate = new Intl.DateTimeFormat("ja-JP", { timeZone: TZ, year: "numeric", month: "long", day: "numeric", weekday: "short" });
+    const fmtTime = new Intl.DateTimeFormat("ja-JP", { timeZone: TZ, hour: "2-digit", minute: "2-digit" });
+    const fmtShort = new Intl.DateTimeFormat("ja-JP", { timeZone: TZ, month: "numeric", day: "numeric", weekday: "short" });
+
+    function esc(s) {
+      return String(s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+    }
+
+    function upcoming(games, now) {
+      return games
+        .map(g => ({ ...g, start: new Date(g.datetime) }))
+        .filter(g => !isNaN(g.start) && g.start.getTime() + GAME_LENGTH_MS > now)
+        .sort((a, b) => a.start - b.start);
+    }
+
+    function render(games) {
+      const now = Date.now();
+      const list = upcoming(games, now);
+
+      if (list.length === 0) {
+        app.innerHTML = '<div class="card"><p class="message">登録されている次の試合はありません。<br>schedule.json に予定を追加してください。</p></div>';
+        return;
+      }
+
+      const [next, ...rest] = list;
+      const started = next.start.getTime() <= now;
+
+      app.innerHTML = `
+        <div class="card">
+          <div class="top">
+            <span class="badge ${next.home ? "home" : "away"}">${next.home ? "HOME" : "AWAY"}</span>
+            ${started ? '<span class="live">● 試合中</span>' : ""}
+          </div>
+          <p class="vs">VS</p>
+          <p class="opponent">${esc(next.opponent)}</p>
+          <dl>
+            <dt>日付</dt><dd>${fmtDate.format(next.start)}</dd>
+            <dt>時間</dt><dd>${fmtTime.format(next.start)} 試合開始</dd>
+            <dt>会場</dt><dd>${esc(next.venue)}</dd>
+          </dl>
+          <div class="countdown">
+            <div class="label">${started ? "試合開始から" : "試合開始まで"}</div>
+            <div class="units">
+              <div class="unit"><span class="num" id="d">-</span><small>日</small></div>
+              <div class="unit"><span class="num" id="h">-</span><small>時間</small></div>
+              <div class="unit"><span class="num" id="m">-</span><small>分</small></div>
+              <div class="unit"><span class="num" id="s">-</span><small>秒</small></div>
+            </div>
+          </div>
+        </div>
+        ${rest.length ? `
+          <h2>その後の予定</h2>
+          <ul class="later">
+            ${rest.map(g => `
+              <li>
+                <span>${fmtShort.format(g.start)} ${fmtTime.format(g.start)}　vs ${esc(g.opponent)}</span>
+                <span class="ha">${g.home ? "HOME" : "AWAY"}</span>
+              </li>`).join("")}
+          </ul>` : ""}
+      `;
+
+      clearInterval(timer);
+      const tick = () => {
+        const t = Date.now();
+        // 試合が終わる時刻を過ぎたら描き直して次の試合へ
+        if (t >= next.start.getTime() + GAME_LENGTH_MS) return render(games);
+        if (!started && t >= next.start.getTime()) return render(games);
+
+        const diff = Math.abs(next.start.getTime() - t);
+        const sec = Math.floor(diff / 1000);
+        document.getElementById("d").textContent = Math.floor(sec / 86400);
+        document.getElementById("h").textContent = String(Math.floor(sec / 3600) % 24).padStart(2, "0");
+        document.getElementById("m").textContent = String(Math.floor(sec / 60) % 60).padStart(2, "0");
+        document.getElementById("s").textContent = String(sec % 60).padStart(2, "0");
+      };
+      tick();
+      timer = setInterval(tick, 1000);
+    }
+
+    fetch("schedule.json", { cache: "no-store" })
+      .then(r => {
+        if (!r.ok) throw new Error(r.status);
+        return r.json();
+      })
+      .then(data => {
+        if (data.note) document.getElementById("note").textContent = data.note;
+        render(Array.isArray(data.games) ? data.games : []);
+      })
+      .catch(() => {
+        app.innerHTML = '<div class="card"><p class="message">schedule.json を読み込めませんでした。</p></div>';
+      });
+  </script>
+</body>
+</html>
