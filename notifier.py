@@ -40,6 +40,12 @@ WATCH_LEAD_MIN = 5            # 見張りを始めるのは試合開始の何分
 MAX_RUN = timedelta(hours=5, minutes=40)  # GitHub Actions の6時間制限より手前で止める
 FALLBACK_UPDATE_MIN = 15      # クォーターが読み取れない時の定期スコア通知間隔
 LIVE_PUSH_SEC = 60            # Webページ用の状況を送る最短間隔(ntfy の送信回数制限に配慮)
+# B.LEAGUE 公式の速報が読んでいる試合データ(プレーの記録・両チームのボックススコア)。latestid で最新の番号が分かる
+GENIUS_URL = "https://b-league.s3.amazonaws.com/web_json/v2_genius_contexts/{key}/{name}"
+GENIUS_READ_SEC = 30          # 試合データを読み直す間隔
+PLAYS_MAX = 8                 # Webページに送る直近のプレーの数
+LIVE_MAX_BYTES = 3900         # ntfy の1件の上限(4096バイト)より少し小さく
+SKIP_PLAY_RE = re.compile(r"プレイヤーイン|プレイヤーアウト|ファウルドローン")   # 交代などは送らない
 BOX_RETRY_MIN = 3             # 選手別得点が読めない時、ボックススコアを開き直す間隔
 
 HEADERS = {"User-Agent": "kings-score-notifier (personal use)"}
@@ -802,6 +808,69 @@ def save_status(g, scorers=None):
         print(f"[status] 保存失敗: {e}")
 
 
+def fetch_genius(key):
+    """公式の速報用の試合データ(JSON)を読む。読めなければ None。"""
+    try:
+        r = requests.get(GENIUS_URL.format(key=key, name="latestid"), headers=HEADERS, timeout=15)
+        r.raise_for_status()
+        latest = r.text.strip()
+        if not latest.isdigit():
+            return None
+        r = requests.get(GENIUS_URL.format(key=key, name=f"{latest}.json"), headers=HEADERS, timeout=20)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        print(f"[genius] 読めませんでした: {e}")
+        return None
+
+
+def genius_live(data, kings_home):
+    """試合データから、Webページ用の {clock, plays, box} を作る。
+    plays は新しい順。スコアや box は「キングス / 相手」に並べ替える。"""
+    to_ko = lambda h, a: (h, a) if kings_home else (a, h)
+    raw = sorted(data.get("PlayByPlays") or [], key=lambda p: p.get("No") or 0)
+    out = {"clock": (raw[-1].get("RestTime") or "") if raw else ""}
+    plays = []
+    for p in reversed(raw):
+        text = re.sub(r"\s+", " ", p.get("PlayText") or "").strip()
+        if not text or SKIP_PLAY_RE.search(text):
+            continue
+        ha = p.get("HomeAway")
+        team = "" if ha not in (1, 2) else ("kings" if (ha == 1) == kings_home else "opp")
+        m = re.match(r"^(\d+)-(\d+)$", p.get("Score") or "")
+        k, o = to_ko(int(m.group(1)), int(m.group(2))) if m else (None, None)
+        per = p.get("Period")
+        period = f"Q{per}" if per in (1, 2, 3, 4) else (f"OT{per - 4}" if isinstance(per, int) and per > 4 else None)
+        plays.append({"period": period, "clock": p.get("RestTime") or "", "text": text[:60],
+                      "team": team, "kings": k, "opp": o})
+        if len(plays) >= PLAYS_MAX:
+            break
+    out["plays"] = plays
+
+    def team_box(rows):
+        # クォーター別・前後半・試合全体の行が混ざっているので、合計得点がいちばん多い区分(=試合全体)を使う
+        by = {}
+        for r in rows or []:
+            if r.get("PlayerID") and r.get("PlayerNameJ"):
+                by.setdefault(r.get("PeriodCategory"), []).append(r)
+        if not by:
+            return []
+        cat = max(by, key=lambda c: sum(int(r.get("Point") or 0) for r in by[c]))
+        res = []
+        for r in by[cat]:
+            t = r.get("PlayTime") or ""
+            pts = int(r.get("Point") or 0)
+            if pts == 0 and re.fullmatch(r"0?0:00|", t):
+                continue   # 出場していない選手
+            res.append({"name": re.sub(r"\s+", " ", r["PlayerNameJ"]).strip(), "min": t, "pts": pts,
+                        "reb": int(r.get("RB_TOT") or 0), "ast": int(r.get("AS") or 0)})
+        return sorted(res, key=lambda x: -x["pts"])
+
+    home, away = team_box(data.get("HomeBoxscores")), team_box(data.get("AwayBoxscores"))
+    out["box"] = dict(zip(("kings", "opp"), to_ko(home, away)))
+    return out
+
+
 def valid_scorers(rows, g):
     """選手別得点がスコアと矛盾しないか(合計がチーム得点を超えていないか)。"""
     if not rows:
@@ -812,7 +881,7 @@ def valid_scorers(rows, g):
 _live_last = {"payload": None, "at": None}
 
 
-def publish_live(g, qt=None, scorers=None, force=False):
+def publish_live(g, qt=None, scorers=None, force=False, extra=None):
     """Webページ(kings-next-game)用に、試合中の状況を ntfy の公開トピックへ送る。
     内容が変わったときだけ、最短 LIVE_PUSH_SEC 秒おきに送る(クォーターが変わった時と force はすぐ送る)。"""
     import json
@@ -832,7 +901,9 @@ def publish_live(g, qt=None, scorers=None, force=False):
         "opponent": g.opp, "home": g.kings_home,
         "kings": g.kings_pts, "opp": g.opp_pts, "period": g.period,
         "quarters": quarters, "scorers": [[n, p] for n, p in (scorers or [])],
+        "opp_short": g.away_short if g.kings_home else g.home_short,
     }
+    payload.update(extra or {})   # 残り時間・直近のプレー・両チームの統計
     last, at = _live_last["payload"], _live_last["at"]
     now = datetime.now(JST)
     if payload == last:
@@ -841,11 +912,24 @@ def publish_live(g, qt=None, scorers=None, force=False):
     if not (force or period_changed or at is None or (now - at).total_seconds() >= LIVE_PUSH_SEC):
         return
     body = json.dumps(dict(payload, updated=now.isoformat(timespec="seconds")), ensure_ascii=False)
+    # ntfy の1件の大きさの上限に収まるよう、大きすぎるときはプレーの数・統計を減らす
+    trimmed = dict(payload, updated=now.isoformat(timespec="seconds"))
+    while len(body.encode("utf-8")) > LIVE_MAX_BYTES:
+        if len(trimmed.get("plays") or []) > 3:
+            trimmed["plays"] = trimmed["plays"][:-1]
+        elif trimmed.get("box", {}).get("opp"):
+            trimmed["box"] = dict(trimmed["box"], opp=trimmed["box"]["opp"][:-1])
+        elif trimmed.get("box", {}).get("kings"):
+            trimmed["box"] = dict(trimmed["box"], kings=trimmed["box"]["kings"][:-1])
+        else:
+            break
+        body = json.dumps(trimmed, ensure_ascii=False)
     try:
         requests.post(f"{NTFY_SERVER}/{LIVE_TOPIC}", data=body.encode("utf-8"),
                       headers={"Content-Type": "application/json"}, timeout=15).raise_for_status()
         _live_last["payload"], _live_last["at"] = payload, now
-        print(f"[live-push] {g.period} {g.kings_pts}-{g.opp_pts} scorers={len(payload['scorers'])}")
+        print(f"[live-push] {g.period} {payload.get('clock', '')} {g.kings_pts}-{g.opp_pts} "
+              f"scorers={len(payload['scorers'])} plays={len(payload.get('plays') or [])} bytes={len(body.encode('utf-8'))}")
     except Exception as e:
         print(f"[live-push] 送信失敗: {e}")
 
@@ -901,6 +985,26 @@ def watch(game):
     ended = set()          # 終了を通知済みのクォーター(0始まり)
     scorers = []           # Webページに出すキングスの選手別得点
     last_box = None
+    genius = {}            # Webページに出す残り時間・直近のプレー・両チームの統計
+    last_genius = None
+
+    def read_genius(g, now):
+        """試合データを読み直し、キングスの選手別得点もそこから取れれば使う。"""
+        nonlocal genius, last_genius, scorers
+        if last_genius is not None and (now - last_genius).total_seconds() < GENIUS_READ_SEC:
+            return
+        last_genius = now
+        data = fetch_genius(g.key)
+        if not data:
+            return
+        try:
+            genius = genius_live(data, g.kings_home)
+        except Exception as e:
+            print(f"[genius] 解析できませんでした: {e}")
+            return
+        rows = [(p["name"], p["pts"]) for p in genius["box"].get("kings", []) if p["pts"] > 0]
+        if valid_scorers(rows, g):
+            scorers = rows
 
     def announce_end(g, idx):
         nonlocal scorers
@@ -982,7 +1086,9 @@ def watch(game):
                         if parts:
                             body += "\n" + " / ".join(parts)
                     rows = fetch_kings_scorers(g)
-                    publish_live(g, qt, rows if valid_scorers(rows, g) else scorers, force=True)
+                    last_genius = None
+                    read_genius(g, datetime.now(JST))
+                    publish_live(g, qt, rows if valid_scorers(rows, g) else scorers, force=True, extra=genius)
                     save_status(g, rows)
                     sc = scorers_text(rows)
                     if sc:
@@ -1054,7 +1160,8 @@ def watch(game):
                     notify("スコア更新", g.scoreline())
                     last_fallback = now
 
-            publish_live(g, qt, scorers)
+            read_genius(g, now)
+            publish_live(g, qt, scorers, extra=genius)
             prev = g
             time.sleep(POLL_SEC)
     finally:
