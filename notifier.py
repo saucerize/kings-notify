@@ -871,6 +871,34 @@ def genius_live(data, kings_home):
     return out
 
 
+def genius_state(data):
+    """試合データの最新のプレーから (ホーム得点, アウェー得点, クォーター) を返す。分からない部分は None。"""
+    raw = sorted(data.get("PlayByPlays") or [], key=lambda p: p.get("No") or 0)
+    home = away = period = None
+    for p in reversed(raw):
+        if period is None:
+            per = p.get("Period")
+            if isinstance(per, int) and per >= 1:
+                period = f"Q{per}" if per <= 4 else f"OT{per - 4}"
+        m = re.match(r"^(\d+)-(\d+)$", p.get("Score") or "")
+        if m:
+            home, away = int(m.group(1)), int(m.group(2))
+            break
+    return home, away, period
+
+
+def apply_genius_state(g, state):
+    """公式ページの表示が遅れているとき、試合データの方が新しければスコアとクォーターを上書きする。"""
+    if not state or g.period == "FINAL":
+        return
+    home, away, period = state
+    if home is not None and away is not None and g.started and home + away >= g.home_score + g.away_score:
+        g.home_score, g.away_score = home, away
+    pi_g, pi_new = period_index(g.period), period_index(period)
+    if pi_new is not None and (pi_g is None or pi_new > pi_g):
+        g.period = period
+
+
 def valid_scorers(rows, g):
     """選手別得点がスコアと矛盾しないか(合計がチーム得点を超えていないか)。"""
     if not rows:
@@ -986,11 +1014,12 @@ def watch(game):
     scorers = []           # Webページに出すキングスの選手別得点
     last_box = None
     genius = {}            # Webページに出す残り時間・直近のプレー・両チームの統計
+    gstate = None          # 試合データから読んだ (ホーム得点, アウェー得点, クォーター)
     last_genius = None
 
     def read_genius(g, now):
         """試合データを読み直し、キングスの選手別得点もそこから取れれば使う。"""
-        nonlocal genius, last_genius, scorers
+        nonlocal genius, gstate, last_genius, scorers
         if last_genius is not None and (now - last_genius).total_seconds() < GENIUS_READ_SEC:
             return
         last_genius = now
@@ -999,10 +1028,12 @@ def watch(game):
             return
         try:
             genius = genius_live(data, g.kings_home)
+            gstate = genius_state(data)
         except Exception as e:
             print(f"[genius] 解析できませんでした: {e}")
             return
         rows = [(p["name"], p["pts"]) for p in genius["box"].get("kings", []) if p["pts"] > 0]
+        apply_genius_state(g, gstate)
         if valid_scorers(rows, g):
             scorers = rows
 
@@ -1116,6 +1147,9 @@ def watch(game):
             played = quarters_played(qt) if qt else 0
             g.period = g.period or live_period or (f"Q{played}" if 1 <= played <= 4 else
                                                     f"OT{played - 4}" if played > 4 else None)
+            # 公式ページのスコア・クォーターは遅れることがあるので、試合データの方が新しければそちらを使う
+            read_genius(g, now)
+            apply_genius_state(g, gstate)
 
             if prev is None or not prev.started:
                 first = prev is not None  # 開始前から見ていたなら「ティップオフ」
@@ -1160,7 +1194,6 @@ def watch(game):
                     notify("スコア更新", g.scoreline())
                     last_fallback = now
 
-            read_genius(g, now)
             publish_live(g, qt, scorers, extra=genius)
             prev = g
             time.sleep(POLL_SEC)
