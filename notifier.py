@@ -830,13 +830,17 @@ def genius_live(data, kings_home):
     to_ko = lambda h, a: (h, a) if kings_home else (a, h)
     raw = sorted(data.get("PlayByPlays") or [], key=lambda p: p.get("No") or 0)
     out = {"clock": (raw[-1].get("RestTime") or "") if raw else ""}
+
+    def play_team(p):
+        # プレーの行には HomeAway が無いので、チーム名で見分ける
+        name = p.get("TeamNameJ") or ""
+        return "" if not name else ("kings" if KINGS_NAME in name else "opp")
     plays = []
     for p in reversed(raw):
         text = re.sub(r"\s+", " ", p.get("PlayText") or "").strip()
         if not text or SKIP_PLAY_RE.search(text):
             continue
-        ha = p.get("HomeAway")
-        team = "" if ha not in (1, 2) else ("kings" if (ha == 1) == kings_home else "opp")
+        team = play_team(p)
         m = re.match(r"^(\d+)-(\d+)$", p.get("Score") or "")
         k, o = to_ko(int(m.group(1)), int(m.group(2))) if m else (None, None)
         per = p.get("Period")
@@ -847,7 +851,7 @@ def genius_live(data, kings_home):
             break
     out["plays"] = plays
 
-    def team_box(rows):
+    def game_rows(rows):
         # クォーター別・前後半・試合全体の行が混ざっているので、合計得点がいちばん多い区分(=試合全体)を使う
         by = {}
         for r in rows or []:
@@ -855,19 +859,51 @@ def genius_live(data, kings_home):
                 by.setdefault(r.get("PeriodCategory"), []).append(r)
         if not by:
             return []
-        cat = max(by, key=lambda c: sum(int(r.get("Point") or 0) for r in by[c]))
+        return by[max(by, key=lambda c: sum(int(r.get("Point") or 0) for r in by[c]))]
+
+    def team_box(rows):
         res = []
-        for r in by[cat]:
+        for r in rows:
             t = r.get("PlayTime") or ""
             pts = int(r.get("Point") or 0)
             if pts == 0 and re.fullmatch(r"0?0:00|", t):
                 continue   # 出場していない選手
             res.append({"name": re.sub(r"\s+", " ", r["PlayerNameJ"]).strip(), "min": t, "pts": pts,
-                        "reb": int(r.get("RB_TOT") or 0), "ast": int(r.get("AS") or 0)})
+                        "reb": int(r.get("RB_TOT") or 0), "ast": int(r.get("AS") or 0),
+                        "tpm": int(r.get("PT3M") or 0)})
         return sorted(res, key=lambda x: -x["pts"])
 
-    home, away = team_box(data.get("HomeBoxscores")), team_box(data.get("AwayBoxscores"))
-    out["box"] = dict(zip(("kings", "opp"), to_ko(home, away)))
+    home_rows, away_rows = game_rows(data.get("HomeBoxscores")), game_rows(data.get("AwayBoxscores"))
+    out["box"] = dict(zip(("kings", "opp"), to_ko(team_box(home_rows), team_box(away_rows))))
+
+    # 観戦ビンゴ用の試合全体の数字(直近のプレーだけでは分からないものを、全プレー・全選手から数える)
+    k_rows, o_rows = to_ko(home_rows, away_rows)
+    tot = lambda rows, key: sum(int(r.get(key) or 0) for r in rows)
+    lead = max_lead = lead_changes = run = best_run = 0
+    prev_k = prev_o = 0
+    leader = None
+    for p in raw:
+        m = re.match(r"^(\d+)-(\d+)$", p.get("Score") or "")
+        if not m:
+            continue
+        k, o = to_ko(int(m.group(1)), int(m.group(2)))
+        if k > prev_k and o == prev_o:
+            run += k - prev_k
+        elif o > prev_o:
+            run = 0
+        best_run = max(best_run, run)
+        prev_k, prev_o = k, o
+        lead = k - o
+        max_lead = max(max_lead, lead)
+        now = "kings" if lead > 0 else "opp" if lead < 0 else leader
+        if leader and now != leader:
+            lead_changes += 1
+        leader = now
+    dunks = sum(1 for p in raw if play_team(p) == "kings" and "ダンク" in (p.get("PlayText") or "")
+                and (p.get("Success") == 1 or "○" in (p.get("PlayText") or "")))
+    out["stats"] = {"k3": tot(k_rows, "PT3M"), "o3": tot(o_rows, "PT3M"), "dunk": dunks,
+                    "blk": tot(k_rows, "BS"), "stl": tot(k_rows, "ST"),
+                    "lead": max_lead, "lc": lead_changes, "run": best_run}
     return out
 
 
