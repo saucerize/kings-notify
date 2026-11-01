@@ -930,7 +930,8 @@ def apply_genius_state(g, state):
     if not state or g.period == "FINAL":
         return
     home, away, period = state
-    if home is not None and away is not None and g.started and home + away >= g.home_score + g.away_score:
+    # 公式ページにスコアがまだ出ていない(試合が始まっていないように見える)ときも、試合データのスコアを使う
+    if home is not None and away is not None and (not g.started or home + away >= g.home_score + g.away_score):
         g.home_score, g.away_score = home, away
     pi_g, pi_new = period_index(g.period), period_index(period)
     if pi_new is not None and (pi_g is None or pi_new > pi_g):
@@ -1116,6 +1117,11 @@ def watch(game):
                 continue
 
             now = datetime.now(JST)
+            # 公式ページは、試合が始まってもしばらくスコアが出ないことがある(11/1 は開始から約35分)。
+            # 開始時刻を過ぎたら試合データも読み、そちらにスコアがあれば試合が始まったとみなす
+            if not g.started and g.tipoff and now >= g.tipoff - timedelta(minutes=1):
+                read_genius(g, now)
+                apply_genius_state(g, gstate)
             print(f"{now:%H:%M:%S} status={g.status!r} period={g.period} "
                   f"{g.home_score}-{g.away_score}")
 
