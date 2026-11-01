@@ -35,9 +35,11 @@ NTFY_SERVER = os.environ.get("NTFY_SERVER", "https://ntfy.sh").rstrip("/")
 LIVE_TOPIC = os.environ.get("NTFY_LIVE_TOPIC", "kings-live-a38853caea").strip()
 
 POLL_SEC = 30
-START_WINDOW_MIN = 75         # この時間内に試合があれば、その起動で待機して担当する
+START_WINDOW_MIN = 150        # この時間内に試合があれば、その起動で待機して担当する
+                              # (GitHub Actions の定期起動は数十分遅れたり飛んだりするので、早めの起動でも待って担当する)
 WATCH_LEAD_MIN = 5            # 見張りを始めるのは試合開始の何分前か
-MAX_RUN = timedelta(hours=5, minutes=40)  # GitHub Actions の6時間制限より手前で止める
+MAX_RUN = timedelta(hours=5, minutes=40)  # GitHub Actions の6時間制限より手前で止める(待機の時間も含めて数える)
+PROCESS_START = datetime.now(JST)   # このプログラムが起動した時刻
 FALLBACK_UPDATE_MIN = 15      # クォーターが読み取れない時の定期スコア通知間隔
 LIVE_PUSH_SEC = 60            # Webページ用の状況を送る最短間隔(ntfy の送信回数制限に配慮)
 # B.LEAGUE 公式の速報が読んでいる試合データ(プレーの記録・両チームのボックススコア)。latestid で最新の番号が分かる
@@ -1035,7 +1037,7 @@ def watch(game):
         _ensure_browser()
     except Exception as e:
         print(f"[boxscore] ブラウザの準備に失敗: {e}")
-    started_at = datetime.now(JST)
+    started_at = PROCESS_START   # 試合前に待っていた時間も含めて、制限時間を数える
     prev = None
     starters_sent = False
     starter_tries = 0
